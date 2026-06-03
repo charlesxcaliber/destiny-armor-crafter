@@ -1,805 +1,983 @@
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect, useMemo } from 'react';
+import { Loader2, X, AlertCircle, LogIn, Info, ChevronsUpDown } from 'lucide-react';
 
-const CLIENT_ID = '52410'; // Your Bungie Client ID
-const API_KEY = 'd7873948e4c74594845880f5aafa9b81'; // Your Bungie API Key
-
-// Dynamically grab the local URL (e.g. https://localhost:5173/destiny-armor-crafter/)
+// --- CONFIGURATION ---
+const CLIENT_ID = '52410'; 
+const API_KEY = 'd7873948e4c74594845880f5aafa9b81'; 
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 
-// Order of stats for rendering
-const STAT_HASHES = [
-  2996146975, // Mobility
-  392767087,  // Resilience
-  1943323491, // Recovery
-  1735777505, // Discipline
-  144602215,  // Intellect
-  4244567218  // Strength
+// Helper to construct Bungie URLs
+const BUNGIE_ROOT = 'https://www.bungie.net';
+const getBungieUrl = (path) => (path ? `${BUNGIE_ROOT}${path}` : '');
+
+const CLASS_MAP = { 0: 'Titan', 1: 'Hunter', 2: 'Warlock' };
+const SLOT_MAP = {
+  45: 'Helmet',
+  46: 'Arms',
+  47: 'Chest',
+  48: 'Legs',
+  49: 'Class Item'
+};
+
+// Destiny 2 stat hashes for armor (Updated for Edge of Fate)
+const STAT_MAP = {
+  2996146975: 'Weapons',
+  392767087: 'Health',
+  1943323491: 'Class',
+  1735777505: 'Grenade',
+  4244567218: 'Melee',
+  144602215: 'Super'
+};
+
+// Inverse map for parsing Edge of Fate Mod names
+const STAT_NAME_TO_HASH = {
+  'Weapons': 2996146975,
+  'Health': 392767087,
+  'Class': 1943323491,
+  'Grenade': 1735777505,
+  'Melee': 4244567218,
+  'Super': 144602215
+};
+
+// Specific ordering for the UI bars
+const STAT_ORDER = [
+  392767087,  // Health
+  4244567218, // Melee
+  1735777505, // Grenade
+  144602215,  // Super
+  1943323491, // Class
+  2996146975  // Weapons
 ];
 
-function App() {
-  // State to manage what screen the user sees
-  const [view, setView] = useState('login'); // 'login', 'loading', 'dashboard'
-  const [loadingStatus, setLoadingStatus] = useState('Initializing...');
+export default function App() {
+  // --- STATE ---
+  const [appState, setAppState] = useState('idle'); // idle, login, loading_manifest, loading_auth, loading_profile, ready, error
+  const [errorMsg, setErrorMsg] = useState(null);
   
-  // State to hold our Bungie data
-  const [auth, setAuth] = useState({ accessToken: null, refreshToken: null });
-  const [memberships, setMemberships] = useState(null);
-  const [characters, setCharacters] = useState([]);
-  const [armor, setArmor] = useState([]);
-  const [builds, setBuilds] = useState([]);
-  const [editingBuild, setEditingBuild] = useState(null);
+  const [manifest, setManifest] = useState(null);
+  const [armorItems, setArmorItems] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [selectedClass, setSelectedClass] = useState(0); // 0: Titan, 1: Hunter, 2: Warlock
   
-  // New State for Build Editor features
-  const [statDefs, setStatDefs] = useState({});
-  const [exotics, setExotics] = useState([]);
-  const [armorSetBonuses, setArmorSetBonuses] = useState([]);
-  const [selectorModal, setSelectorModal] = useState(null); // 'exotic' | 'setBonus'
-  const [generatedBuilds, setGeneratedBuilds] = useState([]);
+  // Specific state for dynamic Set Bonus data since it lives outside the Lite manifest
+  const [selectedSetBonus, setSelectedSetBonus] = useState(null); 
 
-  // This hook runs once when the app first loads
+  // --- TEMPORARY DEBUG EXPOSURE ---
   useEffect(() => {
-    const urlParams = new URLSearchParams(window.location.search);
-    const authCode = urlParams.get('code');
+    window.__D2_MANIFEST = manifest;
+    window.__D2_SELECTED_ITEM = selectedItem;
+  }, [manifest, selectedItem]);
 
-    // If we have a code, we just came back from Bungie.net
-    if (authCode) {
-      setView('loading');
-      setLoadingStatus('Authenticating with Bungie...');
+  // Group the flat armor list by Class -> Slot
+  const groupedArmor = useMemo(() => {
+    const groups = {
+      0: { 45: [], 46: [], 47: [], 48: [], 49: [] },
+      1: { 45: [], 46: [], 47: [], 48: [], 49: [] },
+      2: { 45: [], 46: [], 47: [], 48: [], 49: [] },
+    };
 
-      const authenticate = async () => {
-        try {
-          // Hide the code from the URL for cleanliness
-          window.history.replaceState({}, document.title, window.location.pathname);
-
-          const tokenData = await getAccessToken(authCode);
-          setAuth({
-            accessToken: tokenData.access_token,
-            refreshToken: tokenData.refresh_token
-          });
-
-          setLoadingStatus('Downloading Destiny 2 Manifest...');
-          const manifestRes = await fetch('https://www.bungie.net/Platform/Destiny2/Manifest/', {
-            headers: { 'X-API-Key': API_KEY }
-          });
-          const manifestData = await manifestRes.json();
-          const itemDefPath = manifestData.Response.jsonWorldComponentContentPaths.en.DestinyInventoryItemDefinition;
-          const statDefPath = manifestData.Response.jsonWorldComponentContentPaths.en.DestinyStatDefinition;
-          
-          setLoadingStatus('Parsing Manifest Data...');
-          const [itemDefRes, statDefRes] = await Promise.all([
-            fetch(`https://www.bungie.net${itemDefPath}`),
-            fetch(`https://www.bungie.net${statDefPath}`)
-          ]);
-          const itemDefs = await itemDefRes.json();
-          const statDefsData = await statDefRes.json();
-
-          setLoadingStatus('Extracting Exotics & Manifest Properties...');
-          const uniqueExoticsMap = new Map();
-          const uniqueSetBonusesMap = new Map();
-
-          Object.values(itemDefs).forEach(def => {
-            if (def.itemCategoryHashes?.includes(20)) { // Category 20 is Armor
-              // Find Exotics
-              if (def.inventory?.tierType === 6) { // Tier 6 is Exotic
-                if (!uniqueExoticsMap.has(def.displayProperties.name)) {
-                  uniqueExoticsMap.set(def.displayProperties.name, {
-                    hash: def.hash,
-                    name: def.displayProperties.name,
-                    icon: def.displayProperties.icon,
-                    description: def.displayProperties.description,
-                    classType: def.classType,
-                    bucketHash: def.inventory.bucketTypeHash
-                  });
-                }
-              }
-
-              // Find Set Bonuses dynamically via trait IDs!
-              if (def.traitIds) {
-                def.traitIds.forEach(traitId => {
-                  if (traitId.startsWith('armor_set.')) {
-                    if (!uniqueSetBonusesMap.has(traitId)) {
-                      // Make it pretty: 'armor_set.iron_banner' -> 'Iron Banner'
-                      const cleanName = traitId.split('.').pop().split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-                      uniqueSetBonusesMap.set(traitId, { id: traitId, name: cleanName + " Set", description: "Equip matching armor pieces to activate set bonuses." });
-                    }
-                  }
-                });
-              }
-            }
-          });
-          
-          if (uniqueSetBonusesMap.size === 0) {
-            const knownSets = [
-              { id: 'armor_set.iron_banner', name: 'Iron Banner Set', description: 'Enhances Iron Banner rewards and reputation.' },
-              { id: 'armor_set.trials', name: 'Trials of Osiris Set', description: 'Enhances Trials rewards.' },
-              { id: 'armor_set.raid.root_of_nightmares', name: 'Root of Nightmares Set', description: 'Provides bonuses in the Root of Nightmares raid.' },
-              { id: 'armor_set.raid.crotas_end', name: 'Crota\'s End Set', description: 'Provides bonuses in the Crota\'s End raid.' },
-              { id: 'armor_set.seasonal', name: 'Seasonal Set', description: 'Provides seasonal vendor reputation bonuses.' }
-            ];
-            knownSets.forEach(sb => uniqueSetBonusesMap.set(sb.id, sb));
-          }
-          setExotics(Array.from(uniqueExoticsMap.values()));
-          setArmorSetBonuses(Array.from(uniqueSetBonusesMap.values()));
-
-          const extractedStats = {};
-          STAT_HASHES.forEach(hash => extractedStats[hash] = statDefsData[hash]);
-          setStatDefs(extractedStats);
-
-          setLoadingStatus('Fetching Memberships...');
-          const membershipData = await getMemberships(tokenData.access_token);
-          setMemberships(membershipData.Response);
-
-          const primaryMembership = membershipData.Response.destinyMemberships[0];
-          if (primaryMembership) {
-            setLoadingStatus('Fetching Inventory & Stats...');
-            const profileData = await getProfile(tokenData.access_token, primaryMembership.membershipType, primaryMembership.membershipId);
-            
-            setCharacters(Object.values(profileData.Response.characters.data));
-
-            // Combine Vault, Character, and Equipped Items
-            const vaultItems = profileData.Response.profileInventory?.data?.items || [];
-            const charItems = Object.values(profileData.Response.characterInventories?.data || {}).flatMap(charInv => charInv.items);
-            const equippedItems = Object.values(profileData.Response.characterEquipment?.data || {}).flatMap(charEquip => charEquip.items);
-            
-            const allItems = [...vaultItems, ...charItems, ...equippedItems];
-
-            // Filter for Armor Bucket Hashes (Helmet, Arms, Chest, Legs, Class Item)
-            const armorBuckets = [3448274439, 3551918436, 14239492, 20886954, 1585787867];
-            
-            // Filter using the Manifest definitions, then enrich the data!
-            const enrichedArmor = allItems.filter(item => {
-              const def = itemDefs[item.itemHash];
-              return def && armorBuckets.includes(def.inventory?.bucketTypeHash);
-            }).map(item => ({
-              ...item,
-              definition: itemDefs[item.itemHash],
-              instanceData: profileData.Response.itemComponents?.instances?.data?.[item.itemInstanceId],
-              statsData: profileData.Response.itemComponents?.stats?.data?.[item.itemInstanceId]
-            }));
-            
-            setArmor(enrichedArmor);
-          }
-
-          // We are in! Let's show the dashboard
-          setView('dashboard');
-        } catch (err) {
-          console.error("Auth error:", err);
-          alert("Authentication failed. Check your App config in the Bungie Developer Portal.");
-          setView('login');
+    armorItems.forEach(item => {
+      const cType = item.definition.classType;
+      // Destiny API classType mapping: 0=Titan, 1=Hunter, 2=Warlock
+      if (groups[cType]) {
+        const cats = item.definition.itemCategoryHashes || [];
+        // Find which armor slot category hash this item has
+        const slot = [45, 46, 47, 48, 49].find(h => cats.includes(h));
+        if (slot) {
+          groups[cType][slot].push(item);
         }
-      };
+      }
+    });
 
-      authenticate();
-    }
-  }, []); // The empty array ensures this only runs ONCE on load
+    return groups;
+  }, [armorItems]);
 
-  // Auto update builds when editing
+  // --- INITIALIZATION & AUTH CHECK ---
   useEffect(() => {
-    if (view === 'editor' && editingBuild && armor.length > 0) {
-      const timer = setTimeout(() => {
-        calculateBuilds();
-      }, 500);
-      return () => clearTimeout(timer);
-    }
-  }, [editingBuild, armor, view]);
+    const initialize = async () => {
+      // 1. Check for auth code in URL
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get('code');
 
-  // API Calls
-  const authorize = () => {
-    window.location.href = `https://www.bungie.net/en/OAuth/Authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+      if (code) {
+        // Clean URL so the code doesn't linger
+        window.history.replaceState({}, document.title, window.location.pathname);
+        await processAuthFlow(code);
+      } else {
+        setAppState('login');
+      }
+    };
+
+    initialize();
+  }, []);
+
+  // --- SET BONUS FETCHER ---
+  // When an item is clicked, check if it has a set hash and fetch the detailed perks
+  useEffect(() => {
+    if (!selectedItem) {
+      setSelectedSetBonus(null);
+      return;
+    }
+
+    const fetchSetBonus = async () => {
+      const setHash = selectedItem.definition?.equippingBlock?.equipableItemSetHash;
+      if (!setHash || setHash === 0) return;
+
+      try {
+        // Fetch the Set Definition
+        const setRes = await fetch(`${BUNGIE_ROOT}/Platform/Destiny2/Manifest/DestinyEquipableItemSetDefinition/${setHash}/`, {
+          headers: { 'X-API-Key': API_KEY }
+        });
+        const setDef = (await setRes.json()).Response;
+        
+        if (setDef && setDef.setPerks && setDef.setPerks.length > 0) {
+          const perksWithDefs = await Promise.all(setDef.setPerks.map(async (perkObj) => {
+            const perkRes = await fetch(`${BUNGIE_ROOT}/Platform/Destiny2/Manifest/DestinySandboxPerkDefinition/${perkObj.sandboxPerkHash}/`, {
+              headers: { 'X-API-Key': API_KEY }
+            });
+            const perkDef = (await perkRes.json()).Response;
+            return {
+              count: perkObj.requiredSetCount,
+              name: perkDef?.displayProperties?.name || "Unknown Perk",
+              description: perkDef?.displayProperties?.description || "",
+              icon: perkDef?.displayProperties?.icon
+            };
+          }));
+          
+          setSelectedSetBonus({
+             name: setDef.displayProperties?.name,
+             perks: perksWithDefs.sort((a, b) => a.count - b.count)
+          });
+        }
+      } catch (err) {
+        console.error("Failed to fetch set bonus data:", err);
+      }
+    };
+
+    fetchSetBonus();
+  }, [selectedItem]);
+
+
+  // --- CORE LOGIC ---
+
+  const processAuthFlow = async (code) => {
+    try {
+      setAppState('loading_auth');
+      
+      // 1. Exchange code for token
+      const tokenData = await fetchToken(code);
+      if (!tokenData || !tokenData.access_token) throw new Error("Failed to authenticate with Bungie.");
+      
+      setAppState('loading_manifest');
+      
+      // 2. Fetch Manifest (we need this to identify armor)
+      const manifestData = await fetchManifest();
+      setManifest(manifestData);
+
+      setAppState('loading_profile');
+
+      // 3. Get Memberships for the authenticated user
+      const memberships = await fetchMemberships(tokenData.access_token);
+      if (!memberships || memberships.length === 0) throw new Error("No Destiny 2 memberships found for this account.");
+      
+      // Prefer primary membership, or fallback to the first one
+      const primaryMembership = memberships.find(m => m.membershipId === memberships.primaryMembershipId) || memberships[0];
+
+      // 4. Fetch Profile (Vault, Character Inventory, Character Equipment)
+      const profileData = await fetchProfile(primaryMembership.membershipType, primaryMembership.membershipId, tokenData.access_token);
+      
+      // 5. Process and filter armor
+      processInventory(profileData, manifestData);
+
+      setAppState('ready');
+    } catch (err) {
+      console.error(err);
+      setErrorMsg(err.message || "An unexpected error occurred.");
+      setAppState('error');
+    }
   };
 
-  const getAccessToken = async (code) => {
+  const loginToBungie = () => {
+    const authUrl = `https://www.bungie.net/en/OAuth/Authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+    window.location.href = authUrl;
+  };
+
+  // --- API CALLS ---
+
+  const fetchToken = async (code) => {
     const body = new URLSearchParams({
       grant_type: 'authorization_code',
-      code: code,
       client_id: CLIENT_ID,
-      redirect_uri: REDIRECT_URI
+      code: code
     });
-    const res = await fetch('https://www.bungie.net/Platform/App/OAuth/Token/', {
+
+    const response = await fetch(`${BUNGIE_ROOT}/Platform/App/OAuth/Token/`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body
-    });
-    if (!res.ok) throw new Error("Failed to exchange token.");
-    return res.json();
-  };
-
-  const getMemberships = async (accessToken) => {
-    const res = await fetch('https://www.bungie.net/Platform/User/GetMembershipsForCurrentUser/', {
       headers: {
-        'X-API-Key': API_KEY,
-        'Authorization': `Bearer ${accessToken}`
-      }
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString()
     });
-    if (!res.ok) throw new Error("Failed to get memberships.");
-    return res.json();
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error_description || "Authentication failed.");
+    return data;
   };
 
-  const getProfile = async (accessToken, membershipType, membershipId) => {
-    // 200: Characters, 102: Vault, 201: Char Inventory, 205: Char Equipment, 300: Item Instances, 304: Item Stats
-    const components = "200,102,201,205,300,304";
-    const res = await fetch(`https://www.bungie.net/Platform/Destiny2/${membershipType}/Profile/${membershipId}/?components=${components}`, {
-      headers: {
-        'X-API-Key': API_KEY,
-        'Authorization': `Bearer ${accessToken}`
-      }
+  const fetchManifest = async () => {
+    // 1. Get Manifest links
+    const res = await fetch(`${BUNGIE_ROOT}/Platform/Destiny2/Manifest/`, {
+      headers: { 'X-API-Key': API_KEY }
     });
-    if (!res.ok) throw new Error("Failed to get profile and inventory.");
-    return res.json();
-  };
-
-  const getClassDef = (classType) => {
-    switch(classType) {
-      case 0: return "Titan";
-      case 1: return "Hunter";
-      case 2: return "Warlock";
-      default: return "Unknown";
-    }
-  };
-
-  // The Build Solver!
-  const calculateBuilds = () => {
-    if (!editingBuild) return;
+    const manifestInfo = await res.json();
     
-    const getBucketName = (hash) => {
-      if(hash === 3448274439) return "Helmet";
-      if(hash === 3551918436) return "Gauntlets";
-      if(hash === 14239492) return "Chest Armor";
-      if(hash === 20886954) return "Leg Armor";
-      return "Armor";
-    };
+    // 2. Fetch the Item Definition JSON (using Lite if available to save massive bandwidth, fallback to full)
+    const paths = manifestInfo.Response.jsonWorldComponentContentPaths.en;
+    const itemDefPath = paths.DestinyInventoryItemLiteDefinition || paths.DestinyInventoryItemDefinition;
+    
+    const defRes = await fetch(getBungieUrl(itemDefPath));
+    return await defRes.json();
+  };
 
-    // Generate hypothetically perfect max-stat (68) distributions for simulation
-    const generateTheoreticalArmor = (bucketHash) => {
-      const splits = [
-        [30, 2, 2], [2, 30, 2], [2, 2, 30],
-        [16, 16, 2], [16, 2, 16], [2, 16, 16]
-      ];
-      const pieces = [];
-      let i = 0;
-      splits.forEach(top => {
-        splits.forEach(bot => {
-          pieces.push({
-            isTheoretical: true,
-            itemInstanceId: `theo_${bucketHash}_${i++}`,
-            definition: {
-              displayProperties: {
-                name: `Theoretical ${getBucketName(bucketHash)}`,
-                icon: '/img/misc/missing_icon_d2.png'
-              },
-              inventory: { bucketTypeHash: bucketHash },
-              classType: editingBuild.classType
-            },
-            statsData: {
-              stats: {
-                2996146975: { value: top[0] },
-                392767087:  { value: top[1] },
-                1943323491: { value: top[2] },
-                1735777505: { value: bot[0] },
-                144602215:  { value: bot[1] },
-                4244567218: { value: bot[2] }
-              }
-            }
-          });
-        });
+  const fetchMemberships = async (token) => {
+    const res = await fetch(`${BUNGIE_ROOT}/Platform/User/GetMembershipsForCurrentUser/`, {
+      headers: {
+        'X-API-Key': API_KEY,
+        'Authorization': `Bearer ${token}`
+      }
+    });
+    const data = await res.json();
+    return data.Response.destinyMemberships;
+  };
+
+  const fetchProfile = async (membershipType, membershipId, token) => {
+    // Components: 
+    // 102 (Vault), 201 (Character Inventories), 205 (Character Equipment)
+    // 300 (ItemInstances), 304 (ItemStats), 305 (ItemSockets)
+    const res = await fetch(`${BUNGIE_ROOT}/Platform/Destiny2/${membershipType}/Profile/${membershipId}/?components=102,201,205,300,304,305`, {
+      headers: {
+        'X-API-Key': API_KEY,
+        'Authorization': `Bearer ${token}`
+      }
+    });
+    const data = await res.json();
+    return data.Response;
+  };
+
+  const processInventory = (profile, manifestDb) => {
+    let allItems = [];
+
+    // 1. Vault Items
+    if (profile.profileInventory?.data?.items) {
+      allItems = [...allItems, ...profile.profileInventory.data.items];
+    }
+    
+    // 2. Character Inventories
+    if (profile.characterInventories?.data) {
+      Object.values(profile.characterInventories.data).forEach(char => {
+        allItems = [...allItems, ...char.items];
       });
-      return pieces;
+    }
+
+    // 3. Equipped Items
+    if (profile.characterEquipment?.data) {
+      Object.values(profile.characterEquipment.data).forEach(char => {
+        allItems = [...allItems, ...char.items];
+      });
+    }
+
+    // 4. Map to Definitions, Stats, Sockets and Filter Armor (itemType === 2)
+    const armorList = allItems.reduce((acc, item) => {
+      const def = manifestDb[item.itemHash];
+      if (def && def.itemType === 2) { // 2 corresponds to Armor in Bungie API
+        const instanceId = item.itemInstanceId;
+        
+        // Extract instance-specific data if available
+        const stats = instanceId && profile.itemComponents?.stats?.data?.[instanceId]?.stats;
+        const sockets = instanceId && profile.itemComponents?.sockets?.data?.[instanceId]?.sockets;
+        const instanceData = instanceId && profile.itemComponents?.instances?.data?.[instanceId];
+
+        acc.push({
+          ...item,
+          definition: def,
+          stats: stats || {},
+          sockets: sockets || [],
+          instanceData: instanceData || {}
+        });
+      }
+      return acc;
+    }, []);
+
+    // Sort by tier type (Exotic first) then name
+    armorList.sort((a, b) => {
+      const tierDiff = (b.definition.inventory?.tierType || 0) - (a.definition.inventory?.tierType || 0);
+      if (tierDiff !== 0) return tierDiff;
+      return a.definition.displayProperties.name.localeCompare(b.definition.displayProperties.name);
+    });
+
+    setArmorItems(armorList);
+  };
+
+  // --- UI HELPERS ---
+
+  const getTierColor = (tierType) => {
+    switch (tierType) {
+      case 6: return 'border-yellow-500 shadow-[0_0_10px_rgba(234,179,8,0.5)]'; // Exotic
+      case 5: return 'border-purple-500 shadow-[0_0_10px_rgba(168,85,247,0.5)]'; // Legendary
+      case 4: return 'border-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]'; // Rare
+      case 3: return 'border-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]'; // Uncommon
+      default: return 'border-gray-500 shadow-sm'; // Common/Unknown
+    }
+  };
+
+  // Parse sockets dynamically using manifest definitions & Edge of Fate Name Parsing
+  const parseSockets = (sockets) => {
+    const categories = {
+      masterwork: [],
+      archetype: [],
+      statsAndTuning: [],
+      slotMods: [],
+      intrinsic: [],
+      cosmetics: [],
+      statMods: {
+        2996146975: 0, 392767087: 0, 1943323491: 0,
+        1735777505: 0, 4244567218: 0, 144602215: 0
+      },
+      tuningMods: {
+        2996146975: 0, 392767087: 0, 1943323491: 0,
+        1735777505: 0, 4244567218: 0, 144602215: 0
+      },
+      hasBalancedTuning: false
     };
 
-    let filteredHelmets = generateTheoreticalArmor(3448274439);
-    let filteredArms = generateTheoreticalArmor(3551918436);
-    let filteredChests = generateTheoreticalArmor(14239492);
-    let filteredLegs = generateTheoreticalArmor(20886954);
+    if (!sockets) return categories;
 
-    const targets = editingBuild.targetStats;
-    const mods = editingBuild.modsAndFragments;
+    sockets.forEach((socket, idx) => {
+      if (!socket.plugHash) return;
+      const def = manifest[socket.plugHash];
+      if (!def || !def.displayProperties || !def.displayProperties.name) return;
 
-    if (editingBuild.exotic) {
-      const exHash = editingBuild.exotic.hash;
-      const exBucket = editingBuild.exotic.bucketHash;
-      const exoticPieces = generateTheoreticalArmor(exBucket).map(p => ({
-        ...p,
-        definition: {
-          ...p.definition,
-          displayProperties: {
-            name: editingBuild.exotic.name + " (Simulated)",
-            icon: editingBuild.exotic.icon
-          }
-        }
-      }));
+      const name = def.displayProperties.name;
+      const typeName = def.itemTypeDisplayName || "";
+      const subType = def.itemSubType;
+
+      // Slot 6 filtering: Extract Masterwork/Upgrade socket
+      if (name === "Upgrade Armor" || name.startsWith("Upgrade to")) {
+        categories.masterwork.push(def);
+        return;
+      }
+
+      // Slot 7: Armor Archetype (has no type name, but isn't a cosmetic)
+      if (typeName === "" && name !== "Default Ornament" && !name.includes("Empty")) {
+        categories.archetype.push(def);
+      } 
+      // Slot 1 & Artifice/Tuning Mod: General Stat Mods
+      else if (typeName === "General Armor Mod" || typeName === "Artifice Armor Mod") {
+        categories.statsAndTuning.push(def);
+      } 
+      // Slots 2-4: Slot Specific Armor Mods
+      else if (typeName.includes("Armor Mod")) {
+        categories.slotMods.push(def);
+      } 
+      // Slots 5 & 11: Cosmetics (Shaders and Ornaments)
+      else if (subType === 20 || subType === 21 || typeName === "Shader" || typeName.includes("Ornament") || typeName === "Restore Defaults") {
+        categories.cosmetics.push(def);
+      } 
+      // Slot 9 (12/11 depending on era): Exotic Trait/Intrinsic
+      else {
+        categories.intrinsic.push(def);
+      }
+    });
+
+    // --- EDGE OF FATE CUSTOM STAT PARSER ---
+    categories.statsAndTuning.forEach(def => {
+      const name = def.displayProperties?.name || "";
       
-      if (exBucket === 3448274439) filteredHelmets = exoticPieces;
-      if (exBucket === 3551918436) filteredArms = exoticPieces;
-      if (exBucket === 14239492) filteredChests = exoticPieces;
-      if (exBucket === 20886954) filteredLegs = exoticPieces;
-    }
-
-    const results = [];
-    let iterations = 0;
-    
-    for (let h of filteredHelmets) {
-      for (let a of filteredArms) {
-        for (let c of filteredChests) {
-          for (let l of filteredLegs) {
-            const buildStats = { 2996146975: 0, 392767087: 0, 1943323491: 0, 1735777505: 0, 144602215: 0, 4244567218: 0 };
-            
-            STAT_HASHES.forEach(hash => {
-              buildStats[hash] += h.statsData.stats[hash].value;
-              buildStats[hash] += a.statsData.stats[hash].value;
-              buildStats[hash] += c.statsData.stats[hash].value;
-              buildStats[hash] += l.statsData.stats[hash].value;
-              
-              // Masterwork (+2 per piece, 5 pieces total = +10)
-              buildStats[hash] += 10;
-              
-              // Mods & Fragments
-              buildStats[hash] += (mods[hash] || 0);
-            });
-
-            let deficit = 0;
-            let overage = 0;
-            let meetsMinimums = true;
-
-            STAT_HASHES.forEach(hash => {
-              const target = targets[hash];
-              const val = buildStats[hash];
-              if (val < target.min) {
-                deficit += (target.min - val) * target.priority; // higher priority means worse deficit
-                meetsMinimums = false;
-              }
-              if (val > target.max) {
-                overage += (val - target.max);
-              }
-            });
-
-            if (meetsMinimums || deficit <= 30) { 
-              results.push({
-                id: Math.random(),
-                pieces: [h, a, c, l],
-                stats: buildStats,
-                deficit,
-                overage
-              });
-            }
+      // Handle Hybrid Mods (e.g., "+Super / -Class")
+      if (name.includes("/")) {
+        const parts = name.split(" / ");
+        parts.forEach(part => {
+          if (part.startsWith("+")) {
+            const stat = part.substring(1).trim();
+            const hash = STAT_NAME_TO_HASH[stat];
+            // Corrected to grant +5
+            if (hash) categories.tuningMods[hash] += 5; 
+          } else if (part.startsWith("-")) {
+            const stat = part.substring(1).trim();
+            const hash = STAT_NAME_TO_HASH[stat];
+            if (hash) categories.tuningMods[hash] -= 5;
           }
-        }
+        });
+      } 
+      // Handle Balanced Tuning (Dynamically targets zero-base stats)
+      else if (name === "Balanced Tuning") {
+        categories.hasBalancedTuning = true;
       }
-    }
-    
-    // De-dupe identical stat results for cleaner UI
-    const uniqueResults = [];
-    const seenStats = new Set();
-    
-    const sortedResults = results.sort((a,b) => a.deficit - b.deficit || a.overage - b.overage);
-    
-    for (let res of sortedResults) {
-      const sig = STAT_HASHES.map(hash => res.stats[hash]).join(',');
-      if (!seenStats.has(sig)) {
-        seenStats.add(sig);
-        uniqueResults.push(res);
+      // Handle Standard Stat Mods (e.g., "Health Mod", "Minor Super Mod")
+      else if (name.endsWith(" Mod") && !name.includes("Empty")) {
+        const isMinor = name.includes("Minor");
+        const stat = name.replace("Minor", "").replace("Major", "").replace("Mod", "").trim();
+        const hash = STAT_NAME_TO_HASH[stat];
+        if (hash) categories.statMods[hash] += isMinor ? 5 : 10;
       }
-      if (uniqueResults.length >= 50) break;
-    }
+    });
 
-    setGeneratedBuilds(uniqueResults);
+    return categories;
   };
+
+  const renderModRow = (modArray) => {
+    if (modArray.length === 0) return null;
+    return (
+      <div className="flex flex-wrap gap-2">
+        {modArray.map((plugDef, idx) => (
+          <div key={`${plugDef.hash}-${idx}`} className="relative group w-12 h-12 rounded bg-slate-950 border border-slate-700 hover:border-slate-500 transition-colors cursor-help">
+            <img 
+              src={getBungieUrl(plugDef.displayProperties.icon)} 
+              alt={plugDef.displayProperties.name} 
+              className="w-full h-full object-cover" 
+            />
+            {/* Mod Name Tooltip */}
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-max max-w-[200px] text-center px-3 py-1.5 bg-slate-800 border border-slate-700 text-xs text-slate-200 rounded shadow-lg opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-10">
+              <span className="font-semibold block mb-0.5">{plugDef.displayProperties.name}</span>
+              <span className="text-[10px] text-slate-400">{plugDef.itemTypeDisplayName || 'Upgrade / Masterwork'}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // --- RENDER ---
+
+  if (appState === 'idle') return null;
 
   return (
-    <div className="min-h-screen flex flex-col items-center bg-[#0f172a] text-white">
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500/30">
       
-      {/* Header */}
-      <header className="w-full border-b border-gray-800 bg-gray-900/50 p-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-purple-900/30 rounded-lg border border-purple-500/30">
-              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
-              </svg>
+      {/* HEADER */}
+      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-20">
+        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded bg-indigo-600 flex items-center justify-center">
+              <span className="font-bold text-white tracking-tighter">D2</span>
             </div>
-            <h1 className="text-xl md:text-2xl font-bold tracking-tight">Destiny 2 Armor Buildcrafter</h1>
+            <h1 className="font-semibold text-lg tracking-wide text-slate-200">Armor Viewer</h1>
           </div>
+          {appState === 'ready' && (
+            <div className="text-sm text-slate-400 font-medium">
+              {armorItems.length} Armor Pieces Found
+            </div>
+          )}
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="flex-grow p-4 md:p-8 w-full max-w-7xl mx-auto">
+      {/* MAIN CONTENT AREA */}
+      <main className="max-w-7xl mx-auto px-4 py-8">
         
-        {/* View: Login */}
-        {view === 'login' && (
-          <div className="max-w-2xl mx-auto mt-10 text-center">
-            <div className="rounded-xl p-12 flex flex-col items-center justify-center border border-gray-800 bg-gray-900/50 shadow-2xl">
-              <h2 className="text-3xl font-bold text-gray-100 mb-4">Welcome to the Armor Buildcrafter</h2>
-              <p className="text-gray-400 max-w-xl mx-auto mb-8">
-                Connect your Bungie.net account to analyze your inventory, create powerful builds, and identify the exact armor pieces you need to chase.
-              </p>
-              <button onClick={authorize} className="bg-purple-600 hover:bg-purple-500 text-white px-10 py-4 rounded-lg font-bold transition shadow-lg border border-purple-500/50 text-lg flex items-center gap-3 cursor-pointer">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
-                Login with Bungie.net
-              </button>
+        {/* LOGIN STATE */}
+        {appState === 'login' && (
+          <div className="flex flex-col items-center justify-center mt-24 space-y-6 max-w-md mx-auto text-center">
+            <div className="p-4 bg-indigo-500/10 rounded-full">
+              <LogIn className="w-12 h-12 text-indigo-400" />
             </div>
+            <h2 className="text-3xl font-bold text-white">Connect to Bungie</h2>
+            <p className="text-slate-400">
+              Sign in with your Bungie.net account to securely access and view your Destiny 2 armor inventory across all characters and your vault.
+            </p>
+            <button
+              onClick={loginToBungie}
+              className="mt-4 px-8 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-semibold transition-all transform active:scale-95 shadow-lg shadow-indigo-600/20"
+            >
+              Authorize Account
+            </button>
           </div>
         )}
 
-        {/* View: Loading */}
-        {view === 'loading' && (
-          <div className="max-w-2xl mx-auto mt-10 text-center">
-            <div className="rounded-xl p-12 flex flex-col items-center justify-center border border-gray-800 bg-gray-900/50">
-              <div className="w-10 h-10 border-4 border-gray-300 border-t-purple-500 rounded-full animate-spin mb-6"></div>
-              <h2 className="text-2xl font-bold text-gray-200 animate-pulse">{loadingStatus}</h2>
-            </div>
+        {/* LOADING STATES */}
+        {(appState.startsWith('loading_')) && (
+          <div className="flex flex-col items-center justify-center mt-32 space-y-4">
+            <Loader2 className="w-10 h-10 text-indigo-500 animate-spin" />
+            <p className="text-slate-300 font-medium animate-pulse">
+              {appState === 'loading_auth' && "Authenticating..."}
+              {appState === 'loading_manifest' && "Downloading Item Database (this may take a moment)..."}
+              {appState === 'loading_profile' && "Scanning Characters & Vault..."}
+            </p>
           </div>
         )}
 
-        {/* View: Dashboard */}
-        {view === 'dashboard' && (
-          <div className="animate-fade-in">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-3xl font-bold text-white">My Characters</h2>
-              <button onClick={() => {
-                setGeneratedBuilds([]);
-                setEditingBuild({
-                  id: Date.now(),
-                  name: 'New Build',
-                  classType: 0, // 0: Titan, 1: Hunter, 2: Warlock
-                  subclass: 'Void',
-                  exotic: null,
-                  setBonus: null,
-                  targetStats: { 
-                    2996146975: { min: 0, max: 200, priority: 6 }, // Mob
-                    392767087: { min: 0, max: 200, priority: 1 },  // Res
-                    1943323491: { min: 0, max: 200, priority: 2 }, // Rec
-                    1735777505: { min: 0, max: 200, priority: 3 }, // Dis
-                    144602215: { min: 0, max: 200, priority: 5 },  // Int
-                    4244567218: { min: 0, max: 200, priority: 4 }  // Str
-                  },
-                  modsAndFragments: { 2996146975: 0, 392767087: 0, 1943323491: 0, 1735777505: 0, 144602215: 0, 4244567218: 0 }
-                });
-                setView('editor');
-              }} className="bg-green-600 hover:bg-green-500 text-white px-6 py-2.5 rounded-lg font-bold transition shadow-lg border border-green-500/50 flex items-center gap-2 cursor-pointer">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                New Build
-              </button>
-            </div>
+        {/* ERROR STATE */}
+        {appState === 'error' && (
+          <div className="flex flex-col items-center justify-center mt-24 space-y-4 text-center bg-red-950/30 p-8 rounded-2xl border border-red-900/50 max-w-lg mx-auto">
+            <AlertCircle className="w-12 h-12 text-red-500" />
+            <h3 className="text-xl font-bold text-red-200">Something went wrong</h3>
+            <p className="text-red-400/80">{errorMsg}</p>
+            <button
+              onClick={() => setAppState('login')}
+              className="mt-4 px-6 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium transition-colors"
+            >
+              Try Again
+            </button>
+          </div>
+        )}
 
-            {/* Character Banners */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-              {characters.map(char => (
-                <div key={char.characterId} className="relative rounded-xl overflow-hidden shadow-lg border border-gray-700 bg-gray-800 min-h-[120px]">
-                  <div 
-                    className="absolute inset-0 bg-cover bg-center z-0 opacity-60"
-                    style={{ backgroundImage: `url(https://www.bungie.net${char.emblemBackgroundPath})` }}
-                  ></div>
-                  <div className="relative z-10 p-6 flex flex-col items-start bg-gradient-to-r from-gray-900/90 via-gray-900/60 to-transparent h-full">
-                    <span className="text-2xl font-bold text-white drop-shadow-md">{getClassDef(char.classType)}</span>
-                    <span className="text-yellow-400 font-bold text-xl drop-shadow-md flex items-center gap-1 mt-1">
-                      <span className="text-sm">✧</span>{char.light}
-                    </span>
-                  </div>
-                </div>
+        {/* READY / GRID STATE */}
+        {appState === 'ready' && (
+          <div className="space-y-10">
+            {/* Class Tabs */}
+            <div className="flex space-x-2 border-b border-slate-800 pb-4 overflow-x-auto">
+              {[0, 1, 2].map(classType => (
+                <button
+                  key={classType}
+                  onClick={() => setSelectedClass(classType)}
+                  className={`px-6 py-2 rounded-full font-semibold transition-colors whitespace-nowrap ${
+                    selectedClass === classType 
+                      ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20' 
+                      : 'bg-slate-800/50 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {CLASS_MAP[classType]}
+                </button>
               ))}
             </div>
 
-            {/* Inventory Status Widget */}
-            <div className="grid grid-cols-1 gap-6">
-              <div className="p-8 rounded-xl text-center flex flex-col items-center justify-center border border-gray-700 bg-gray-800/50 shadow-lg relative overflow-hidden">
-                <div className="absolute -top-10 -right-10 w-40 h-40 bg-purple-600/10 rounded-full blur-3xl"></div>
-                <div className="absolute -bottom-10 -left-10 w-40 h-40 bg-blue-600/10 rounded-full blur-3xl"></div>
-                
-                <h3 className="text-2xl font-bold text-gray-200 mb-2 relative z-10">Inventory Synced</h3>
-                <p className="text-gray-400 text-lg relative z-10">
-                  We found <span className="text-purple-400 font-bold mx-1">{armor.length}</span> pieces of armor across your Vault and Characters.
-                </p>
-                
-                {/* Prove the manifest is working by showing the first 4 items! */}
-                <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 relative z-10 w-full">
-                  {armor.slice(0, 4).map((item, idx) => (
-                    <div key={idx} className="flex items-center gap-3 bg-gray-900/80 p-3 rounded-lg border border-gray-700">
-                      <img src={`https://www.bungie.net${item.definition.displayProperties.icon}`} className="w-10 h-10 rounded" alt="icon"/>
-                      <div className="text-left overflow-hidden">
-                        <p className="text-sm font-bold text-gray-200 truncate">{item.definition.displayProperties.name}</p>
-                        <p className="text-xs text-yellow-400">Power: {item.instanceData?.primaryStat?.value || 'N/A'}</p>
-                      </div>
-                    </div>
-                  ))}
+            {/* Slot Sections */}
+            {Object.entries(SLOT_MAP).map(([slotHash, slotName]) => {
+              const items = groupedArmor[selectedClass][slotHash] || [];
+              if (items.length === 0) return null;
+
+              return (
+                <div key={slotHash} className="space-y-4">
+                  <h3 className="text-xl font-bold text-slate-200 border-b border-slate-800/50 pb-2 flex items-baseline">
+                    {slotName}
+                    <span className="text-sm font-normal text-slate-500 ml-3">({items.length})</span>
+                  </h3>
+                  <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 xl:grid-cols-12 gap-2">
+                    {items.map((item, idx) => {
+                      const def = item.definition;
+                      const iconUrl = getBungieUrl(def.displayProperties.icon);
+                      const tierType = def.inventory?.tierType;
+                      
+                      return (
+                        <div 
+                          key={`${item.itemInstanceId}-${idx}`}
+                          onClick={() => setSelectedItem(item)}
+                          className={`
+                            relative aspect-square bg-slate-800 rounded-md cursor-pointer 
+                            overflow-hidden border-2 transition-all duration-200
+                            hover:scale-105 hover:z-10 group
+                            ${getTierColor(tierType)}
+                          `}
+                        >
+                          <img 
+                            src={iconUrl} 
+                            alt={def.displayProperties.name}
+                            className="w-full h-full object-cover"
+                            loading="lazy"
+                          />
+                          {/* Hover Overlay */}
+                          <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                            <Info className="w-6 h-6 text-white" />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
+              );
+            })}
+            
+            {/* Empty State for selected class */}
+            {Object.values(groupedArmor[selectedClass]).flat().length === 0 && (
+              <div className="py-20 text-center text-slate-500">
+                No armor pieces found for your {CLASS_MAP[selectedClass]}.
               </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      {/* ITEM MODAL */}
+      {selectedItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm" onClick={() => setSelectedItem(null)}>
+          <div 
+            className="bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl max-w-md w-full flex flex-col max-h-[90vh]"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Modal Header/Banner */}
+            <div className="relative h-32 bg-slate-800 flex items-end p-4 border-b-4 shrink-0" style={{ 
+              borderBottomColor: 
+                selectedItem.definition.inventory?.tierType === 6 ? '#eab308' :
+                selectedItem.definition.inventory?.tierType === 5 ? '#a855f7' :
+                selectedItem.definition.inventory?.tierType === 4 ? '#3b82f6' : '#64748b'
+             }}>
+               {/* Background Watermark */}
+               <div 
+                 className="absolute inset-0 opacity-20 bg-cover bg-center"
+                 style={{ backgroundImage: `url(${getBungieUrl(selectedItem.definition.displayProperties.icon)})`, filter: 'blur(10px)' }}
+               />
+               
+               <div className="relative z-10 flex gap-4 items-end">
+                  <div className={`w-16 h-16 rounded border-2 ${getTierColor(selectedItem.definition.inventory?.tierType)} bg-slate-950 overflow-hidden`}>
+                    <img src={getBungieUrl(selectedItem.definition.displayProperties.icon)} alt="icon" className="w-full h-full object-cover" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold text-white leading-tight">
+                      {selectedItem.definition.displayProperties.name}
+                    </h2>
+                    <p className="text-sm font-medium text-slate-300">
+                      {selectedItem.definition.itemTypeDisplayName}
+                    </p>
+                  </div>
+               </div>
+               
+               <button 
+                 onClick={() => setSelectedItem(null)}
+                 className="absolute top-4 right-4 p-1 rounded-full bg-black/40 hover:bg-black/60 text-white transition-colors"
+               >
+                 <X className="w-5 h-5" />
+               </button>
             </div>
 
-            {/* Builds Section */}
-            <div className="mt-12 mb-12">
-              <h2 className="text-3xl font-bold text-white mb-6">My Builds</h2>
-              {builds.length === 0 ? (
-                <div className="p-6 rounded-xl text-center flex flex-col items-center justify-center h-48 border-2 border-dashed border-gray-700 bg-gray-900/50">
-                  <p className="text-gray-400">You have no builds yet.</p>
-                  <p className="text-gray-500 text-sm mt-2">Click "New Build" to start crafting!</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {builds.map(build => (
-                    <div key={build.id} className="p-6 rounded-xl border border-gray-700 bg-gray-800 shadow-lg flex flex-col">
-                      <h3 className="text-xl font-bold text-purple-400">{build.name}</h3>
-                      <div className="mt-4 grid grid-cols-2 gap-2 text-sm text-gray-300 mb-6">
-                        {STAT_HASHES.map(hash => {
-                          const target = build.targetStats[hash];
+            {/* Modal Body (Scrollable) */}
+            <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
+              
+              {/* Flavor Text */}
+              <p className="text-slate-400 italic text-sm leading-relaxed border-l-2 border-slate-700 pl-4">
+                "{selectedItem.definition.displayProperties.description || 'No description available.'}"
+              </p>
+
+              {/* Pre-parse sockets to use across multiple sections */}
+              {(() => {
+                const parsedSockets = parseSockets(selectedItem.sockets);
+                const { masterwork, archetype, statsAndTuning, slotMods, intrinsic, cosmetics, statMods, tuningMods, hasBalancedTuning } = parsedSockets;
+                
+                // Identify MW behavior: 3.0 (has Archetype) vs 2.0 (no Archetype)
+                const isArmor3 = archetype.length > 0;
+                let zeroBaseHashes = [];
+                const finalTuningMods = { ...tuningMods };
+                
+                if (isArmor3) {
+                   // In 3.0, to find the true natural zeroes, we must subtract the modifiers from the API's total
+                   const naturalStats = STAT_ORDER.map(hash => {
+                      const apiTotal = selectedItem.stats[hash]?.value || 0;
+                      const val = apiTotal - (statMods[hash] || 0) - (tuningMods[hash] || 0);
+                      return { hash, val };
+                   });
+                   // The 3 lowest natural values represent the zero-base stats that receive the MW bonus
+                   naturalStats.sort((a, b) => a.val - b.val);
+                   zeroBaseHashes = naturalStats.slice(0, 3).map(obj => obj.hash);
+
+                   // Apply Balanced Tuning dynamically to the identified zero-base stats
+                   if (hasBalancedTuning) {
+                     zeroBaseHashes.forEach(hash => {
+                       finalTuningMods[hash] += 1;
+                     });
+                   }
+                }
+
+                return (
+                  <>
+                    {/* Armor Stats Section */}
+                    {Object.keys(selectedItem.stats).length > 0 && (
+                      <div className="pt-4 border-t border-slate-800/50">
+                        <div className="flex flex-col gap-1.5 bg-slate-900/50 p-3 rounded-lg border border-slate-800/50">
+                          {STAT_ORDER.map(hash => {
+                            const name = STAT_MAP[hash];
+                            
+                            // 1. Isolate the API's Final Total
+                            const apiTotal = selectedItem.stats[hash]?.value || 0;
+
+                            // 2. Extract Mod Stats
+                            const statModValue = statMods[hash] || 0;
+                            const tuningModValue = finalTuningMods[hash] || 0;
+                            
+                            // 3. Deduce Natural Stat (Base + Masterwork)
+                            const naturalStat = apiTotal - statModValue - tuningModValue;
+
+                            // 4. Split Natural Stat into Base and Masterwork
+                            let mwValue = 0;
+                            let baseValue = 0;
+
+                            if (isArmor3) {
+                                if (zeroBaseHashes.includes(hash)) {
+                                    mwValue = naturalStat; // Because Base is 0, the entire natural stat is MW
+                                    baseValue = 0;
+                                } else {
+                                    mwValue = 0;
+                                    baseValue = naturalStat;
+                                }
+                            } else {
+                                // Armor 2.0 Logic: +2 to all if Energy is 10
+                                const energy = selectedItem.instanceData?.energy?.energyCapacity || 0;
+                                mwValue = energy === 10 ? 2 : 0;
+                                baseValue = Math.max(0, naturalStat - mwValue);
+                            }
+                            
+                            // 5. Visual Bar calculations
+                            const totalValue = apiTotal;
+                            const penalty = Math.abs(tuningModValue < 0 ? tuningModValue : 0);
+                            const bonus = statModValue + (tuningModValue > 0 ? tuningModValue : 0);
+
+                            const isZero = totalValue === 0;
+                            const isNegative = totalValue < 0;
+                            const isModified = (statModValue !== 0) || (tuningModValue !== 0) || (mwValue !== 0);
+                            
+                            const MAX_STAT = 42; 
+
+                            // Define visible segments
+                            const activeBase = Math.max(0, baseValue - penalty);
+                            const activeMw = mwValue; // For 3.0, MW happens on 0-base stats, so penalty eats MW if base=0. But Destiny normally draws it sequentially.
+
+                            return (
+                              <div key={hash} className="group relative flex items-center text-[13px] leading-none cursor-default">
+                                
+                                {/* Stat Tooltip (Shown on Hover) */}
+                                <div className="absolute left-1/2 bottom-full mb-1 -translate-x-1/2 w-max p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-2xl opacity-0 group-hover:opacity-100 pointer-events-none z-30 text-xs transition-opacity">
+                                  <div className="text-slate-400 flex justify-between gap-4"><span>Base:</span> <span className="text-white">{baseValue}</span></div>
+                                  {mwValue > 0 && <div className="text-slate-400 flex justify-between gap-4"><span>Masterwork:</span> <span className="text-amber-400">+{mwValue}</span></div>}
+                                  {statModValue !== 0 && <div className="text-slate-400 flex justify-between gap-4"><span>Stat Mod:</span> <span className="text-sky-400">{statModValue > 0 ? '+' : ''}{statModValue}</span></div>}
+                                  {tuningModValue !== 0 && <div className="text-slate-400 flex justify-between gap-4"><span>Tuning Mod:</span> <span className={tuningModValue > 0 ? "text-sky-400" : "text-red-400"}>{tuningModValue > 0 ? '+' : ''}{tuningModValue}</span></div>}
+                                  <div className="mt-1.5 pt-1.5 border-t border-slate-700 flex justify-between gap-4 font-bold">
+                                    <span className="text-white">Total:</span> 
+                                    <span className={isNegative ? "text-red-500" : "text-white"}>{totalValue}</span>
+                                  </div>
+                                </div>
+
+                                {/* Modified Icon Indicator */}
+                                <div className="w-5 flex justify-center text-slate-300">
+                                  {isModified && <ChevronsUpDown className="w-3 h-3" />}
+                                </div>
+                                
+                                <span className={`w-20 text-right pr-2 ${!isZero ? 'font-bold' : ''} ${isNegative ? 'text-red-600' : 'text-white'}`}>
+                                  {name}
+                                </span>
+                                <span className={`w-8 text-right font-mono ${!isZero ? 'font-bold' : ''} ${isNegative ? 'text-red-600' : 'text-white'}`}>
+                                  {totalValue > 0 ? `+${totalValue}` : totalValue}
+                                </span>
+                                
+                                {/* Generic Icon Space Placeholder */}
+                                <div className="w-6 flex justify-center opacity-70 ml-1">
+                                   <div className="w-2 h-2 bg-slate-500 rounded-sm rotate-45"></div>
+                                </div>
+
+                                {/* Composite Segmented Bar */}
+                                <div className="flex-1 bg-slate-800 h-3 flex items-center justify-start overflow-hidden ml-1 relative">
+                                  
+                                  {/* Draw standard positive layout if total is >= 0 */}
+                                  {totalValue >= 0 && (
+                                    <>
+                                      {activeBase > 0 && <div className="bg-white h-full" style={{ width: `${(activeBase / MAX_STAT) * 100}%` }}></div>}
+                                      {penalty > 0 && <div className="bg-red-800 h-full" style={{ width: `${(penalty / MAX_STAT) * 100}%` }}></div>}
+                                      {activeMw > 0 && <div className="bg-amber-400 h-full shadow-[0_0_8px_rgba(251,191,36,0.8)] z-10" style={{ width: `${(activeMw / MAX_STAT) * 100}%` }}></div>}
+                                      {bonus > 0 && <div className="bg-sky-400 h-full" style={{ width: `${(bonus / MAX_STAT) * 100}%` }}></div>}
+                                    </>
+                                  )}
+                                  
+                                  {/* If Total falls negative due to penalty eating everything */}
+                                  {totalValue < 0 && (
+                                     <div className="bg-red-900/80 h-full absolute left-0 top-0" style={{ width: `${(Math.abs(totalValue) / MAX_STAT) * 100}%` }}></div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                          
+                          {/* Stat Total Calculation */}
+                          {(() => {
+                            let totalBase = 0;
+                            let totalMw = 0;
+                            let totalStatMod = 0;
+                            let totalTuningMod = 0;
+
+                            STAT_ORDER.forEach(hash => {
+                                const apiTotal = selectedItem.stats[hash]?.value || 0;
+                                const sm = statMods[hash] || 0;
+                                const tm = finalTuningMods[hash] || 0;
+                                const nat = apiTotal - sm - tm;
+                                
+                                if (isArmor3) {
+                                    if (zeroBaseHashes.includes(hash)) {
+                                        totalMw += nat;
+                                    } else {
+                                        totalBase += nat;
+                                    }
+                                } else {
+                                    const energy = selectedItem.instanceData?.energy?.energyCapacity || 0;
+                                    const mw = energy === 10 ? 2 : 0;
+                                    totalMw += mw;
+                                    totalBase += Math.max(0, nat - mw);
+                                }
+                                
+                                totalStatMod += sm;
+                                totalTuningMod += tm;
+                            });
+                            
+                            const overallTotal = totalBase + totalMw + totalStatMod + totalTuningMod;
+                            const allModsSum = totalStatMod + totalTuningMod;
+                            
+                            return (
+                              <div className="flex items-center text-[13px] leading-none mt-1">
+                                <div className="w-5"></div>
+                                <span className="w-20 text-right pr-2 text-white font-bold">Total</span>
+                                <div className="w-8 flex flex-col items-end">
+                                  <div className="w-6 border-t border-white mb-1"></div>
+                                  <span className="text-white font-bold font-mono">
+                                    {overallTotal}
+                                  </span>
+                                </div>
+                                <div className="flex-1 ml-8 flex items-center gap-1.5 font-mono text-xs">
+                                  {allModsSum !== 0 && (
+                                    <>
+                                      <span className="text-slate-400">{totalBase + totalMw}</span>
+                                      <span className={allModsSum > 0 ? "text-sky-400 font-medium" : "text-red-500 font-medium"}>
+                                        {allModsSum > 0 ? '+' : ''}{allModsSum}
+                                      </span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Archetype, Exotic Trait & Set Bonus Banner */}
+                    {(archetype.length > 0 || intrinsic.length > 0 || selectedSetBonus) && (
+                      <div className="pt-2 space-y-2">
+                        {/* Archetype */}
+                        {archetype.map((def, idx) => {
+                          const rawDesc = def.displayProperties.description || '';
+                          // Filter out the flavor text to only show the "Primary Stat / Secondary Stat" lines
+                          const statLines = rawDesc.split('\n').filter(line => line.includes('Stat:'));
+                          
                           return (
-                            <div key={hash} className="flex justify-between items-center bg-gray-900 px-2 py-1 rounded border border-gray-700">
-                              <img src={`https://www.bungie.net${statDefs[hash]?.displayProperties?.icon}`} alt="" className="w-4 h-4" />
-                              <span className="font-mono font-bold text-white">{target.min}-{target.max}</span>
+                            <div key={`arch-${idx}`} className="flex items-center gap-3 py-1">
+                              <div className="relative w-10 h-10 flex items-center justify-center shrink-0">
+                                <img src={getBungieUrl(def.displayProperties.icon)} alt={def.displayProperties.name} className="w-full h-full object-contain" />
+                              </div>
+                              <div className="flex flex-col">
+                                <h4 className="text-sm font-bold text-slate-200">{def.displayProperties.name}</h4>
+                                {statLines.map((line, i) => (
+                                  <p key={i} className="text-[11px] text-slate-400 font-medium">
+                                    {line}
+                                  </p>
+                                ))}
+                              </div>
                             </div>
                           );
                         })}
-                      </div>
-                      <button onClick={() => { setEditingBuild(build); setGeneratedBuilds([]); setView('editor'); }} className="mt-auto bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-bold transition cursor-pointer">Edit Build</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* View: Build Editor */}
-        {view === 'editor' && editingBuild && (
-          <div className="animate-fade-in flex flex-col h-[85vh]">
-            {(() => {
-              const sortedHashes = [...STAT_HASHES].sort((a,b) => editingBuild.targetStats[a].priority - editingBuild.targetStats[b].priority);
-              return (
-                <>
-            {/* Build Editor Header */}
-            <div className="flex justify-between items-center pb-4 border-b border-gray-800 mb-4 shrink-0">
-              <input 
-                type="text" 
-                value={editingBuild.name}
-                onChange={(e) => setEditingBuild({...editingBuild, name: e.target.value})}
-                className="bg-transparent border-b-2 border-transparent hover:border-gray-700 focus:border-purple-500 text-3xl font-bold text-white focus:outline-none transition px-2 py-1 max-w-sm"
-              />
-              <div className="flex items-center gap-4">
-                  <span className="text-sm text-gray-500 font-mono">Found {generatedBuilds.length} builds</span>
-                  <button onClick={() => { setView('dashboard'); setGeneratedBuilds([]); }} className="text-gray-400 hover:text-white transition cursor-pointer px-4 py-2">Cancel</button>
-                  <button onClick={() => {
-                    setBuilds(prev => {
-                      const idx = prev.findIndex(b => b.id === editingBuild.id);
-                      if (idx >= 0) { const updated = [...prev]; updated[idx] = editingBuild; return updated; }
-                      return [...prev, editingBuild];
-                    });
-                    setView('dashboard');
-                    setGeneratedBuilds([]);
-                  }} className="bg-purple-600 hover:bg-purple-500 text-white font-bold px-6 py-2 rounded transition shadow-[0_0_10px_rgba(168,85,247,0.4)] border border-purple-500 cursor-pointer">
-                    Save Build
-                  </button>
-              </div>
-            </div>
-            
-            <div className="flex flex-col lg:flex-row gap-6 h-full min-h-0">
-              
-              {/* Left Sidebar: DIM-style Filters */}
-              <div className="w-full lg:w-1/3 xl:w-1/4 flex flex-col gap-6 overflow-y-auto pr-2 custom-scrollbar">
-                
-                <div className="bg-gray-800 border border-gray-700 rounded p-4 shadow-lg">
-                  <h3 className="text-gray-300 font-bold uppercase tracking-wider text-xs mb-3">Loadout Identity</h3>
-                  <div className="flex flex-col gap-3">
-                    <select 
-                      value={editingBuild.classType}
-                      onChange={(e) => setEditingBuild({...editingBuild, classType: parseInt(e.target.value), exotic: null})}
-                      className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white focus:outline-none focus:border-purple-500 transition text-sm"
-                    >
-                      <option value={0}>Titan</option>
-                      <option value={1}>Hunter</option>
-                      <option value={2}>Warlock</option>
-                    </select>
-                    <select 
-                      value={editingBuild.subclass || 'Void'}
-                      onChange={(e) => setEditingBuild({...editingBuild, subclass: e.target.value})}
-                      className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white focus:outline-none focus:border-purple-500 transition text-sm"
-                    >
-                      <option value="Void">Void</option><option value="Solar">Solar</option><option value="Arc">Arc</option>
-                      <option value="Stasis">Stasis</option><option value="Strand">Strand</option><option value="Prismatic">Prismatic</option>
-                    </select>
-                    <button 
-                      onClick={() => setSelectorModal('exotic')}
-                      className="w-full flex items-center justify-between bg-gray-900 border border-gray-700 rounded p-2 text-white hover:border-yellow-500 transition text-left text-sm cursor-pointer"
-                    >
-                      {editingBuild.exotic ? (
-                        <div className="flex items-center gap-2">
-                          <img src={`https://www.bungie.net${editingBuild.exotic.icon}`} className="w-5 h-5 rounded" alt=""/>
-                          <span className="font-bold text-yellow-400 truncate">{editingBuild.exotic.name}</span>
-                        </div>
-                      ) : (
-                        <span className="text-gray-500 italic">No Exotic Selected</span>
-                      )}
-                    </button>
-                    <button 
-                      onClick={() => setSelectorModal('setBonus')}
-                      className="w-full flex items-center justify-between bg-gray-900 border border-gray-700 rounded p-2 text-white hover:border-blue-500 transition text-left text-sm cursor-pointer"
-                    >
-                      {editingBuild.setBonus ? (
-                        <span className="font-bold text-blue-400 truncate">{editingBuild.setBonus.name}</span>
-                      ) : (
-                        <span className="text-gray-500 italic">No Set Bonus Required</span>
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="bg-gray-800 border border-gray-700 rounded p-4 shadow-lg">
-                    <h3 className="text-gray-300 font-bold uppercase tracking-wider text-xs mb-3">Stat Tiers</h3>
-                    <div className="flex flex-col gap-3">
-                      {sortedHashes.map((hash) => {
-                        const target = editingBuild.targetStats[hash];
-                        const def = statDefs[hash];
-                        if(!def) return null;
                         
-                        return (
-                          <div 
-                            key={hash} 
-                            draggable 
-                            onDragStart={(e) => e.dataTransfer.setData('hash', hash.toString())}
-                            onDragOver={(e) => e.preventDefault()}
-                            onDrop={(e) => {
-                              e.preventDefault();
-                              const srcHash = parseInt(e.dataTransfer.getData('hash'));
-                              if(srcHash && srcHash !== hash) {
-                                const arr = [...sortedHashes];
-                                const srcIdx = arr.indexOf(srcHash);
-                                const tgtIdx = arr.indexOf(hash);
-                                arr.splice(srcIdx, 1);
-                                arr.splice(tgtIdx, 0, srcHash);
-                                
-                                const newTargets = { ...editingBuild.targetStats };
-                                arr.forEach((h, idx) => {
-                                  newTargets[h] = { ...newTargets[h], priority: idx + 1 };
-                                });
-                                
-                                setEditingBuild(prev => ({ ...prev, targetStats: newTargets }));
-                              }
-                            }}
-                            className="flex flex-col bg-gray-900 p-2 rounded border border-gray-700 cursor-move hover:border-gray-500 transition shadow-sm"
-                          >
-                            <div className="flex justify-between items-center mb-2">
-                              <div className="flex items-center gap-2">
-                                <div className="text-gray-500 cursor-move" title="Drag to reorder priority">☰</div>
-                                <img src={`https://www.bungie.net${def.displayProperties.icon}`} className="w-5 h-5" alt="stat icon"/>
-                                <span className="font-bold text-gray-300 text-sm">{def.displayProperties.name}</span>
+                        {/* Set Bonus Info (Edge of Fate) */}
+                        {selectedSetBonus && selectedSetBonus.perks.length > 0 && (
+                          <div className="flex flex-col gap-1.5 py-2">
+                            <h4 className="text-sm font-bold text-indigo-400 border-b border-indigo-900/50 pb-1 mb-1">
+                              {selectedSetBonus.name} Set
+                            </h4>
+                            {selectedSetBonus.perks.map((perk, idx) => (
+                              <div key={idx} className="flex items-start gap-2">
+                                <div className="text-xs font-bold text-indigo-300 whitespace-nowrap pt-0.5">
+                                  {perk.count}-piece:
+                                </div>
+                                <div className="text-[11px] text-slate-300 font-medium leading-relaxed">
+                                  <span className="font-bold text-slate-200 mr-1">{perk.name} -</span>
+                                  {perk.description}
+                                </div>
                               </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Exotic Trait / Intrinsic */}
+                        {intrinsic.map((def, idx) => (
+                          <div key={`intr-${idx}`} className="flex items-start gap-3 py-1">
+                            <div className="relative w-10 h-10 flex items-center justify-center shrink-0 bg-slate-900 rounded border border-slate-700/50 p-1">
+                              <img src={getBungieUrl(def.displayProperties.icon)} alt={def.displayProperties.name} className="w-full h-full object-contain" />
                             </div>
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="flex items-center gap-1">
-                                <span className="text-[10px] text-gray-500">Min:</span>
-                                <input 
-                                  type="number" min="0" max="200" value={target.min}
-                                  onChange={(e) => setEditingBuild({ ...editingBuild, targetStats: { ...editingBuild.targetStats, [hash]: { ...target, min: parseInt(e.target.value) || 0 } } })}
-                                  className="w-12 bg-gray-800 text-white p-0.5 text-xs text-center rounded border border-gray-600 focus:border-purple-500 outline-none"
-                                />
-                              </div>
-                              <div className="flex items-center gap-1">
-                                <span className="text-[10px] text-gray-500">Max:</span>
-                                <input 
-                                  type="number" min="0" max="200" value={target.max}
-                                  onChange={(e) => setEditingBuild({ ...editingBuild, targetStats: { ...editingBuild.targetStats, [hash]: { ...target, max: parseInt(e.target.value) || 0 } } })}
-                                  className="w-12 bg-gray-800 text-white p-0.5 text-xs text-center rounded border border-gray-600 focus:border-purple-500 outline-none"
-                                />
-                              </div>
+                            <div className="flex flex-col">
+                              <h4 className="text-sm font-bold text-amber-400">{def.displayProperties.name}</h4>
+                              <p className="text-[11px] text-slate-400 font-medium leading-relaxed mt-0.5">
+                                {def.displayProperties.description}
+                              </p>
                             </div>
                           </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-
-              {/* Generated Builds UI */}
-              <div className="flex-1 overflow-y-auto bg-gray-900 border border-gray-700 rounded shadow-inner p-2 custom-scrollbar relative min-h-[50vh]">
-                {generatedBuilds.length === 0 ? (
-                  <div className="absolute inset-0 flex items-center justify-center text-center p-6 text-gray-500">
-                    No builds found matching these requirements. Try lowering the minimum stats.
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {generatedBuilds.map(build => (
-                      <div key={build.id} className="bg-gray-800 border border-gray-700 p-3 rounded flex flex-col xl:flex-row gap-4 xl:items-center hover:border-gray-500 transition">
-                        <div className="flex gap-2 shrink-0">
-                          {build.pieces.map((p, i) => (
-                            <img key={i} src={`https://www.bungie.net${p.definition.displayProperties.icon}`} className="w-10 h-10 rounded border border-gray-600" alt="armor" title={p.definition.displayProperties.name} />
-                          ))}
-                        </div>
-                        <div className="flex-grow grid grid-cols-6 gap-x-2 gap-y-1 w-full xl:ml-auto xl:max-w-xl">
-                           {STAT_HASHES.map((hash) => {
-                             const val = build.stats[hash];
-                             const target = editingBuild.targetStats[hash];
-                             const isMet = val >= target.min && val <= target.max;
-                             
-                             return (
-                               <div key={hash} className="flex flex-col">
-                                 <div className="flex justify-between items-center px-1">
-                                   <img src={`https://www.bungie.net${statDefs[hash]?.displayProperties?.icon}`} alt="" className="w-3 h-3 opacity-50" />
-                                   <span className={`text-xs font-mono font-bold ${isMet ? 'text-gray-200' : 'text-red-400'}`}>{val}</span>
-                                 </div>
-                                 <div className="h-1.5 w-full bg-gray-900 rounded-full overflow-hidden mt-0.5 border border-gray-700">
-                                   <div className={`h-full ${isMet ? 'bg-green-500' : 'bg-red-500'} ${val > target.max ? 'bg-yellow-500' : ''}`} style={{ width: `${Math.min(100, (val / 200) * 100)}%`}}></div>
-                                 </div>
-                               </div>
-                             );
-                           })}
-                        </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+
+                    {/* Sockets / Mods Section (Structured Rows) */}
+                    {(() => {
+                      const hasGridMods = masterwork.length > 0 || statsAndTuning.length > 0 || slotMods.length > 0 || cosmetics.length > 0;
+                      if (!hasGridMods) return null;
+
+                      return (
+                        <div className="pt-4 border-t border-slate-800/50">
+                          <h4 className="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">Sockets & Mods</h4>
+                          <div className="flex flex-col gap-4 bg-slate-900/30 p-4 rounded-lg border border-slate-800/50">
+                            
+                            {/* Row 0: Masterwork / Upgrade */}
+                            {masterwork.length > 0 && (
+                              <div>
+                                <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1.5">Masterwork Status</span>
+                                {renderModRow(masterwork)}
+                              </div>
+                            )}
+
+                            {/* Row 1: Stat & Tuning Mods */}
+                            {statsAndTuning.length > 0 && (
+                              <div>
+                                <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1.5">Stat Mods</span>
+                                {renderModRow(statsAndTuning)}
+                              </div>
+                            )}
+                            
+                            {/* Row 2: Slot-Specific Armor Mods */}
+                            {slotMods.length > 0 && (
+                              <div>
+                                <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1.5">Armor Mods</span>
+                                {renderModRow(slotMods)}
+                              </div>
+                            )}
+
+                            {/* Row 3: Cosmetics (Shaders & Ornaments) */}
+                            {cosmetics.length > 0 && (
+                              <div>
+                                <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold block mb-1.5">Cosmetics</span>
+                                {renderModRow(cosmetics)}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </>
+                );
+              })()}
+              
+              {/* Technical Details Section */}
+              <div className="pt-4 border-t border-slate-800/50">
+                <h4 className="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-3">Technical Details</h4>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div className="bg-slate-950/50 p-2 rounded">
+                    <span className="block text-slate-500 text-xs">Item Hash</span>
+                    <span className="font-mono text-slate-300 truncate block" title={selectedItem.itemHash}>{selectedItem.itemHash}</span>
                   </div>
-                )}
+                  <div className="bg-slate-950/50 p-2 rounded">
+                    <span className="block text-slate-500 text-xs">Tier</span>
+                    <span className="text-slate-300">{selectedItem.definition.inventory?.tierTypeName || 'Unknown'}</span>
+                  </div>
+                  <div className="bg-slate-950/50 p-2 rounded col-span-2">
+                    <span className="block text-slate-500 text-xs">Instance ID</span>
+                    <span className="font-mono text-slate-300 truncate block" title={selectedItem.itemInstanceId}>{selectedItem.itemInstanceId || 'N/A (Not Instanced)'}</span>
+                  </div>
+                </div>
               </div>
-            </div>
-                </>
-              );
-            })()}
-          </div>
-        )}
 
-      </main>
-
-      {/* DIM Style Selector Modal */}
-      {selectorModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-3xl max-h-[80vh] flex flex-col shadow-2xl overflow-hidden">
-            <div className="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-800/50">
-              <h3 className="text-xl font-bold text-white">
-                {selectorModal === 'exotic' ? 'Select Exotic Armor' : 'Select Set Bonus'}
-              </h3>
-              <button onClick={() => setSelectorModal(null)} className="text-gray-400 hover:text-white cursor-pointer transition">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-              </button>
-            </div>
-            
-            <div className="p-4 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {selectorModal === 'exotic' && exotics.filter(e => e.classType === editingBuild.classType).map(ex => (
-                <div 
-                  key={ex.hash} 
-                  onClick={() => { setEditingBuild({...editingBuild, exotic: ex}); setSelectorModal(null); }}
-                  className="flex gap-4 p-3 rounded-lg border border-gray-700 bg-gray-800 hover:bg-gray-700 hover:border-yellow-500 cursor-pointer transition group"
-                >
-                  <img src={`https://www.bungie.net${ex.icon}`} className="w-12 h-12 rounded border border-gray-600 group-hover:border-yellow-500" alt=""/>
-                  <div>
-                    <h4 className="font-bold text-yellow-400 text-sm">{ex.name}</h4>
-                    <p className="text-xs text-gray-400 line-clamp-2 mt-1">{ex.description}</p>
-                  </div>
-                </div>
-              ))}
-
-              {selectorModal === 'setBonus' && armorSetBonuses.map(set => (
-                <div 
-                  key={set.id} 
-                  onClick={() => { setEditingBuild({...editingBuild, setBonus: set}); setSelectorModal(null); }}
-                  className="flex gap-4 p-3 rounded-lg border border-gray-700 bg-gray-800 hover:bg-gray-700 hover:border-blue-500 cursor-pointer transition group"
-                >
-                  <div className="w-12 h-12 min-w-[3rem] bg-blue-900/30 rounded flex items-center justify-center border border-blue-500/30 group-hover:border-blue-500">
-                    <span className="text-blue-400 font-bold text-xs">SET</span>
-                  </div>
-                  <div>
-                    <h4 className="font-bold text-blue-400 text-sm">{set.name}</h4>
-                    <p className="text-xs text-gray-400 mt-1">{set.description}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-            
-            <div className="p-4 border-t border-gray-800 bg-gray-800/50">
-               <button onClick={() => { 
-                 setEditingBuild({...editingBuild, [selectorModal === 'exotic' ? 'exotic' : 'setBonus']: null}); 
-                 setSelectorModal(null); 
-               }} className="w-full py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm font-bold text-white transition cursor-pointer">
-                 Clear Selection
-               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Footer */}
-      <footer className="w-full bg-gray-900/50 border-t border-gray-800 p-6 text-center text-gray-600 text-sm mt-auto">
-        <p className="mb-2">Destiny 2 Tool Suite &bull; Created by <span className="text-gray-400">MrCharles</span></p>
-        <p className="text-xs">Not affiliated with Bungie. Destiny 2 is a registered trademark of Bungie, Inc.</p>
-      </footer>
-
     </div>
-  )
+  );
 }
-
-export default App
